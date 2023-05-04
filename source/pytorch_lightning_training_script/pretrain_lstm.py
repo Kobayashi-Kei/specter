@@ -656,7 +656,9 @@ def main():
                 labelList = [args.label]
             else:
                 labelList = ["title", "bg", "obj", "method", "res"]
-
+                
+            line_notify("172.21.:" + os.path.basename(__file__) + "が開始")
+            
             model = Specter(args)
 
             # default logger used by trainer
@@ -729,11 +731,11 @@ def main():
             # with open(dirPath + "args.json", "w") as f:
             #     json.dump(vars(args), f, indent=4)
 
-            line_notify("172.21.65.47:" + os.path.basename(__file__) + "が終了")
+            line_notify("172.21.:" + os.path.basename(__file__) + "が終了")
 
     except Exception as e:
         print(traceback.format_exc())
-        message = "172.21.65.47: Error: " + \
+        message = "172.21.: Error: " + \
             os.path.basename(__file__) + " " + str(traceback.format_exc())
         line_notify(message)
 
