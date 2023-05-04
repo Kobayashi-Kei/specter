@@ -1,4 +1,9 @@
 # basic python packages
+from allennlp.data.tokenizers.token import Token
+from allennlp.data.tokenizers.word_splitter import WordSplitter
+from allennlp.data.token_indexers import TokenIndexer
+from allennlp.data.tokenizers import Tokenizer
+from allennlp.data.dataset_readers.dataset_reader import DatasetReader
 from transformers.optimization import (
     Adafactor,
     get_cosine_schedule_with_warmup,
@@ -24,12 +29,7 @@ import glob
 import random
 import numpy as np
 import itertools
-import requests
 import logging
-import os
-import traceback
-import matplotlib.pyplot as plt
-
 logger = logging.getLogger(__name__)
 
 # pytorch packages
@@ -38,12 +38,11 @@ logger = logging.getLogger(__name__)
 
 # huggingface transformers packages
 
+# allennlp dataloading packages
 
 # Globe constants
 training_size = 684100
 # validation_size = 145375
-
-bertOutputSize = 768
 
 # log_every_n_steps how frequently pytorch lightning logs.
 # By default, Lightning logs every 50 rows, or 50 training steps.
@@ -61,86 +60,201 @@ arg_to_scheduler_choices = sorted(arg_to_scheduler.keys())
 arg_to_scheduler_metavar = "{" + ", ".join(arg_to_scheduler_choices) + "}"
 
 
-"""
-自分で定義するデータセット
-"""
+class DataReaderFromPickled(DatasetReader):
+    """
+    This is copied from https://github.com/allenai/specter/blob/673346f9f76bcf422b38e0d1b448ef4414bcd4df/specter/data.py#L61:L109 without any change
+    """
+
+    def __init__(self,
+                 lazy: bool = False,
+                 word_splitter: WordSplitter = None,
+                 tokenizer: Tokenizer = None,
+                 token_indexers: Dict[str, TokenIndexer] = None,
+                 max_sequence_length: int = 256,
+                 concat_title_abstract: bool = None
+                 ) -> None:
+        """
+        Dataset reader that uses pickled preprocessed instances
+        Consumes the output resulting from data_utils/create_training_files.py
+
+        the additional arguments are not used here and are for compatibility with
+        the other data reader at prediction time
+        """
+        self.max_sequence_length = max_sequence_length
+        self.token_indexers = token_indexers
+        self._concat_title_abstract = concat_title_abstract
+        super().__init__(lazy)
+
+    def _read(self, file_path: str):
+        """
+        Args:
+            file_path: path to the pickled instances
+        """
+        with open(file_path, 'rb') as f_in:
+            unpickler = pickle.Unpickler(f_in)
+            while True:
+                try:
+                    instance = unpickler.load()
+                    # compatibility with old models:
+                    # for field in instance.fields:
+                    #     if hasattr(instance.fields[field], '_token_indexers') and 'bert' in instance.fields[field]._token_indexers:
+                    #         if not hasattr(instance.fields['source_title']._token_indexers['bert'], '_truncate_long_sequences'):
+                    #             instance.fields[field]._token_indexers['bert']._truncate_long_sequences = True
+                    #             instance.fields[field]._token_indexers['bert']._token_min_padding_length = 0
+                    if self.max_sequence_length:
+                        for paper_type in ['source', 'pos', 'neg']:
+                            if self._concat_title_abstract:
+                                tokens = []
+                                title_field = instance.fields.get(
+                                    f'{paper_type}_title')
+                                abst_field = instance.fields.get(
+                                    f'{paper_type}_abstract')
+                                if title_field:
+                                    tokens.extend(title_field.tokens)
+                                if tokens:
+                                    tokens.extend([Token('[SEP]')])
+                                if abst_field:
+                                    tokens.extend(abst_field.tokens)
+                                if title_field:
+                                    title_field.tokens = tokens
+                                    instance.fields[f'{paper_type}_title'] = title_field
+                                elif abst_field:
+                                    abst_field.tokens = tokens
+                                    instance.fields[f'{paper_type}_title'] = abst_field
+                                else:
+                                    yield None
+                                # title_tokens = get_text_tokens(query_title_tokens, query_abstract_tokens, abstract_delimiter)
+                                # pos_title_tokens = get_text_tokens(pos_title_tokens, pos_abstract_tokens, abstract_delimiter)
+                                # neg_title_tokens = get_text_tokens(neg_title_tokens, neg_abstract_tokens, abstract_delimiter)
+                                # query_abstract_tokens = pos_abstract_tokens = neg_abstract_tokens = []
+                            for field_type in ['title', 'abstract', 'authors', 'author_positions']:
+                                field = paper_type + '_' + field_type
+                                if instance.fields.get(field):
+                                    instance.fields[field].tokens = instance.fields[field].tokens[
+                                        :self.max_sequence_length]
+                                if field_type == 'abstract' and self._concat_title_abstract:
+                                    instance.fields.pop(field, None)
+                    yield instance
+                except EOFError:
+                    break
 
 
-class MyData(IterableDataset):
-    # def __init__(self, data, tokenizer, size):
-    def __init__(self, data, labeled_abst_Dict, label, tokenizer, block_size=100):
-        self.data_instances = data
-        self.labeled_abst_dict = labeled_abst_Dict
-        self.label = label
+class IterableDataSetMultiWorker(IterableDataset):
+    def __init__(self, file_path, tokenizer, size, block_size=100):
+        self.datareaderfp = DataReaderFromPickled(max_sequence_length=512)
+        self.data_instances = self.datareaderfp._read(file_path)
         self.tokenizer = tokenizer
+        self.size = size
         self.block_size = block_size
-
-        # self.size = size
-        # self.max_length = max_length
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
-        # for data_instance in self.data_instances:
-        #         yield self.retTransformersInput(data_instance, self.tokenizer)
-
         if worker_info is None:
-            for data_instance in self.data_instances:
-                yield self.retTransformersInput(data_instance, self.tokenizer)
+            iter_end = self.size
+            for data_instance in itertools.islice(self.data_instances, iter_end):
+                data_input = self.ai2_to_transformers(
+                    data_instance, self.tokenizer)
+                yield data_input
+
         else:
+            # when num_worker is greater than 1. we implement multiple process data loading.
+            iter_end = self.size
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
             i = 0
-            for data_instance in self.data_instances:
+            for data_instance in itertools.islice(self.data_instances, iter_end):
                 if int(i / self.block_size) % num_workers != worker_id:
                     i = i + 1
                     pass
                 else:
                     i = i + 1
-                    yield self.retTransformersInput(data_instance, self.tokenizer)
+                    data_input = self.ai2_to_transformers(
+                        data_instance, self.tokenizer)
+                    yield data_input
 
-    def retTransformersInput(self, data_instance, tokenizer):
-        sourceEncoded = self.tokenizer(
-            self.labeled_abst_dict[data_instance["source"]][self.label],
-            padding="max_length",
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-        )
-        posEncoded = self.tokenizer(
-            self.labeled_abst_dict[data_instance["pos"]][self.label],
-            padding="max_length",
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-        )
-        negEncoded = self.tokenizer(
-            self.labeled_abst_dict[data_instance["neg"]][self.label],
-            padding="max_length",
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-        )
-        source_input = {
-            'input_ids': sourceEncoded["input_ids"][0],
-            'attention_mask': sourceEncoded["attention_mask"][0],
-            'token_type_ids': sourceEncoded["token_type_ids"][0]
-        }
-        pos_input = {
-            'input_ids': posEncoded["input_ids"][0],
-            'attention_mask': posEncoded["attention_mask"][0],
-            'token_type_ids': posEncoded["token_type_ids"][0]
-        }
-        neg_input = {
-            'input_ids': negEncoded["input_ids"][0],
-            'attention_mask': negEncoded["attention_mask"][0],
-            'token_type_ids': negEncoded["token_type_ids"][0]
-        }
+    def ai2_to_transformers(self, data_instance, tokenizer):
+        """
+        Args:
+            data_instance: ai2 data instance
+            tokenizer: huggingface transformers tokenizer
+        """
+        source_tokens = data_instance["source_title"].tokens
+        source_title = tokenizer(' '.join([str(token) for token in source_tokens]),
+                                 truncation=True, padding="max_length", return_tensors="pt",
+                                 max_length=512)
+        source_input = {'input_ids': source_title['input_ids'][0],
+                        'token_type_ids': source_title['token_type_ids'][0],
+                        'attention_mask': source_title['attention_mask'][0]}
+
+        pos_tokens = data_instance["pos_title"].tokens
+        pos_title = tokenizer(' '.join([str(token) for token in pos_tokens]),
+                              truncation=True, padding="max_length", return_tensors="pt", max_length=512)
+
+        pos_input = {'input_ids': pos_title['input_ids'][0],
+                     'token_type_ids': pos_title['token_type_ids'][0],
+                     'attention_mask': pos_title['attention_mask'][0]}
+
+        neg_tokens = data_instance["neg_title"].tokens
+        neg_title = tokenizer(' '.join([str(token) for token in neg_tokens]),
+                              truncation=True, padding="max_length", return_tensors="pt", max_length=512)
+
+        neg_input = {'input_ids': neg_title['input_ids'][0],
+                     'token_type_ids': neg_title['token_type_ids'][0],
+                     'attention_mask': neg_title['attention_mask'][0]}
+
         return source_input, pos_input, neg_input
 
 
-"""
-ロス計算を行うモジュール
-"""
+class IterableDataSetMultiWorkerTestStep(IterableDataset):
+    def __init__(self, file_path, tokenizer, size, block_size=100):
+        self.datareaderfp = DataReaderFromPickled(max_sequence_length=512)
+        self.data_instances = self.datareaderfp._read(file_path)
+        self.tokenizer = tokenizer
+        self.size = size
+        self.block_size = block_size
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            iter_end = self.size
+            for data_instance in itertools.islice(self.data_instances, iter_end):
+                data_input = self.ai2_to_transformers(
+                    data_instance, self.tokenizer)
+                yield data_input
+
+        else:
+            # when num_worker is greater than 1. we implement multiple process data loading.
+            iter_end = self.size
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            i = 0
+            for data_instance in itertools.islice(self.data_instances, iter_end):
+                if int(i / self.block_size) % num_workers != worker_id:
+                    i = i + 1
+                    pass
+                else:
+                    i = i + 1
+                    data_input = self.ai2_to_transformers(
+                        data_instance, self.tokenizer)
+                    yield data_input
+
+    def ai2_to_transformers(self, data_instance, tokenizer):
+        """
+        Args:
+            data_instance: ai2 data instance
+            tokenizer: huggingface transformers tokenizer
+        """
+        source_tokens = data_instance["source_title"].tokens
+        source_title = tokenizer(' '.join([str(token) for token in source_tokens]),
+                                 truncation=True, padding="max_length", return_tensors="pt",
+                                 max_length=512)
+        source_input = {'input_ids': source_title['input_ids'][0],
+                        'token_type_ids': source_title['token_type_ids'][0],
+                        'attention_mask': source_title['attention_mask'][0]}
+
+        source_paper_id = data_instance['source_paper_id'].metadata
+
+        return source_input, source_paper_id
 
 
 class TripletLoss(nn.Module):
@@ -204,11 +318,6 @@ class TripletLoss(nn.Module):
                 f"Unrecognized option for `reduction`:{self.reduction}")
 
 
-"""
-モデルのクラス
-"""
-
-
 class Specter(pl.LightningModule):
     def __init__(self, init_args):
         super().__init__()
@@ -218,30 +327,14 @@ class Specter(pl.LightningModule):
         checkpoint_path = init_args.checkpoint_path
         logger.info(f'loading model from checkpoint: {checkpoint_path}')
 
-        self.label = init_args.label
         self.hparams = init_args
-
-        # SciBERTを初期値とする場合
         self.model = AutoModel.from_pretrained(
             "allenai/scibert_scivocab_cased")
         self.tokenizer = AutoTokenizer.from_pretrained(
             "allenai/scibert_scivocab_cased")
-
-        # SPECTERを初期値とする場合
-        # self.model = AutoModel.from_pretrained("allenai/specter")
-        # self.tokenizer = AutoTokenizer.from_pretrained("allenai/specter")
-
-        # BERTの出力トークンを統合するレイヤー
-        # input_size: 各時刻における入力ベクトルのサイズ、ここではBERTの出力の768次元になる
-        # hidden_size: メモリセルとかゲートの隠れ層の次元、出力のベクトルの次元もこの値になる（Batch_size, sequence_length, hidden_size)
-        #   chatGPTによると一般的には、LSTMの隠れ層の次元は、入力データの次元と同じであることが多い
-        self.lstm = nn.LSTM(input_size=bertOutputSize,
-                            hidden_size=bertOutputSize, batch_first=True)
-        # self.regressor = nn.Linear(in_features=self.config.hidden_size, out_features=1)
-
         self.tokenizer.model_max_length = self.model.config.max_position_embeddings
         self.hparams.seqlen = self.model.config.max_position_embeddings
-        self.triple_loss = TripletLoss(margin=float(init_args.margin))
+        self.triple_loss = TripletLoss()
         # number of training instances
         self.training_size = None
         # number of testing instances
@@ -250,70 +343,40 @@ class Specter(pl.LightningModule):
         self.test_size = None
         # This is a dictionary to save the embeddings for source papers in test step.
         self.embedding_output = {}
-        self.lossList = []
 
     def forward(self, input_ids, token_type_ids, attention_mask):
         # in lightning, forward defines the prediction/inference actions
         source_embedding = self.model(
             input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
-
-        # lstmの出力は（Batch_size, sequence_length, hidden_size)の次元のテンソル。
-        # 最後のLSTMの出力を得るにはsequence_lengthの最後、つまり[:,-1,:]を指定すればいい
-        out, _ = self.lstm(source_embedding['last_hidden_state'], None)
-        print("-------------------")
-        print("---out---")
-        print(out)
-
-        print("---sequence_output ----")
-        sequence_output = out[:, -1, :]
-        print(sequence_output)
-        exit()
-        return sequence_output
-
-    """
-    このメソッドでallennlp用のデータをロードして、トークナイズまで行う（tokentype_id, attention_maskなど)
-    -> つまりこのメソッドに関わる箇所を書き換えればいい。
-    """
+        return source_embedding[1]
 
     def _get_loader(self, split):
-        path = "/workspace/dataserver/axcell/large/specter/" + \
-            self.hparams.method + "/triple-" + \
-            self.label + "-" + split + ".json"
-        with open(path, 'r') as f:
-            data = json.load(f)
+        if split == 'train':
+            fname = self.hparams.train_file
+            size = self.training_size
+        elif split == 'dev':
+            fname = self.hparams.dev_file
+            size = self.validation_size
+        elif split == 'test':
+            fname = self.hparams.test_file
+            size = self.test_size
+        else:
+            assert False
 
-        print(path)
-        print("-----data length -----", len(data))
-        path = "/workspace/dataserver/axcell/large/labeledAbst.json"
-        with open(path, 'r') as f:
-            labeledAbstDict = json.load(f)
-        # 扱いやすいようにアブストだけでなくタイトルもvalueで参照できるようにしておく
-        for title in labeledAbstDict:
-            labeledAbstDict[title]["title"] = title
-
-        dataset = MyData(data, labeledAbstDict, self.label, self.tokenizer)
+        if split == 'test':
+            dataset = IterableDataSetMultiWorkerTestStep(
+                file_path=fname, tokenizer=self.tokenizer, size=size)
+        else:
+            dataset = IterableDataSetMultiWorker(
+                file_path=fname, tokenizer=self.tokenizer, size=size)
 
         # pin_memory enables faster data transfer to CUDA-enabled GPU.
         loader = DataLoader(dataset, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers,
                             shuffle=False, pin_memory=False)
-
-        # print(loader)
         return loader
-
-    """
-    これはよくわからん、絶対に呼び出されるやつ？
-    """
 
     def setup(self, mode):
         self.train_loader = self._get_loader("train")
-
-    """
-    以下はすべてPytorch Lightningの指定のメソッド
-    そのためこのファイル内には呼び出している箇所は無い。
-    """
-    """
-    allennlp用のデータを読み取り、変換する
-    """
 
     def train_dataloader(self):
         return self.train_loader
@@ -325,9 +388,6 @@ class Specter(pl.LightningModule):
     def test_dataloader(self):
         return self._get_loader('test')
 
-    """
-    学習の設定等に関わるメソッド群
-    """
     @property
     def total_steps(self) -> int:
         """The number of total training steps that will be run. Used for lr scheduler purposes."""
@@ -391,9 +451,6 @@ class Specter(pl.LightningModule):
                  on_epoch=False, prog_bar=True, logger=True)
         self.log('rate', lr_scheduler.get_last_lr()
                  [-1], on_step=True, on_epoch=False, prog_bar=True, logger=True)
-
-        self.lossList.append(loss.detach().cpu().numpy())
-        # print(self.lossList)
         return {"loss": loss}
 
     def validation_step(self, batch, batch_idx):
@@ -447,10 +504,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint_path', default=None,
                         help='path to the model (if not setting checkpoint)')
-    parser.add_argument('--method')
-    parser.add_argument('--margin', default=1)
-    parser.add_argument('--label', default=None)
-    parser.add_argument('--version', default=0)
+    parser.add_argument('--train_file')
+    parser.add_argument('--dev_file')
+    parser.add_argument('--test_file')
     parser.add_argument('--input_dir', default=None,
                         help='optionally provide a directory of the data and train/test/dev files will be automatically detected')
     parser.add_argument('--batch_size', default=1, type=int)
@@ -514,143 +570,62 @@ def get_train_params(args):
     train_params['log_every_n_steps'] = log_every_n_steps
     return train_params
 
-# LINEに通知する関数
-
-
-def line_notify(message):
-    line_notify_token = 'Jou3ZkH4ajtSTaIWO3POoQvvCJQIdXFyYUaRKlZhHMI'
-    line_notify_api = 'https://notify-api.line.me/api/notify'
-    payload = {'message': message}
-    headers = {'Authorization': 'Bearer ' + line_notify_token}
-    requests.post(line_notify_api, data=payload, headers=headers)
-
 
 def main():
-    try:
-        args = parse_args()
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        if args.num_workers == 0:
-            print("num_workers cannot be less than 1")
-            return
+    args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.num_workers == 0:
+        print("num_workers cannot be less than 1")
+        return
 
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(args.seed)
-        if ',' in args.gpus:
-            args.gpus = list(map(int, args.gpus.split(',')))
-            args.total_gpus = len(args.gpus)
-        else:
-            args.gpus = int(args.gpus)
-            args.total_gpus = args.gpus
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    if ',' in args.gpus:
+        args.gpus = list(map(int, args.gpus.split(',')))
+        args.total_gpus = len(args.gpus)
+    else:
+        args.gpus = int(args.gpus)
+        args.total_gpus = args.gpus
 
-        if args.test_only:
-            print('loading model...')
-            model = Specter.load_from_checkpoint(args.test_checkpoint)
-            trainer = pl.Trainer(
-                gpus=args.gpus, limit_val_batches=args.limit_val_batches)
-            trainer.test(model)
+    if args.test_only:
+        print('loading model...')
+        model = Specter.load_from_checkpoint(args.test_checkpoint)
+        trainer = pl.Trainer(
+            gpus=args.gpus, limit_val_batches=args.limit_val_batches)
+        trainer.test(model)
 
-        else:
-            if args.label:
-                labelList = [args.label]
-            else:
-                labelList = ["title", "bg", "obj", "method", "res"]
+    else:
 
-            line_notify("172.21.64.47: specterのtrain.pyが開始")
+        model = Specter(args)
 
-            for label in labelList:
-                args.label = label
+        # default logger used by trainer
+        logger = TensorBoardLogger(
+            save_dir=args.save_dir,
+            version=0,
+            name='pl-logs'
+        )
 
-                model = Specter(args)
+        # second part of the path shouldn't be f-string
+        filepath = f'{args.save_dir}/version_{logger.version}/checkpoints/' + \
+            'ep-{epoch}_avg_val_loss-{avg_val_loss:.3f}'
+        checkpoint_callback = ModelCheckpoint(
+            filepath=filepath,
+            save_top_k=1,
+            verbose=True,
+            monitor='avg_val_loss',  # monitors metrics logged by self.log.
+            mode='min',
+            prefix=''
+        )
 
-                # default logger used by trainer
-                logger = TensorBoardLogger(
-                    save_dir=args.save_dir,
-                    version=args.version,
-                    name='pl-logs'
-                )
+        extra_train_params = get_train_params(args)
 
-                # second part of the path shouldn't be f-string
-                dirPath = f'/workspace/dataserver/model_outputs/specter/{args.method}_{logger.version}/'
-                filepath = dirPath + 'checkpoints/' + args.label + \
-                    '-ep-{epoch}_avg_val_loss-{avg_val_loss:.3f}'
-                checkpoint_callback = ModelCheckpoint(
-                    filepath=filepath,
-                    save_top_k=4,
-                    verbose=True,
-                    # monitors metrics logged by self.log.
-                    monitor='avg_val_loss',
-                    mode='min',
-                    prefix=''
-                )
+        trainer = pl.Trainer(logger=logger,
+                             checkpoint_callback=checkpoint_callback,
+                             **extra_train_params)
 
-                extra_train_params = get_train_params(args)
-
-                trainer = pl.Trainer(logger=logger,
-                                     checkpoint_callback=checkpoint_callback,
-                                     **extra_train_params)
-
-                trainer.fit(model)
-
-                """
-                ロスの可視化
-                """
-                dataPath = "/workspace/dataserver/axcell/large/specter/" + \
-                    args.method + "/triple-" + \
-                    args.label + "-train.json"
-                with open(dataPath, 'r') as f:
-                    data = json.load(f)
-
-                fig = plt.figure()
-                x = list(range(1, len(model.lossList) + 1))
-                for i in range(1, args.num_epochs):
-                    # trainningデータの長さをバッチサイズで割り、1を足す
-                    vlineValue = (int(len(data)/args.batch_size)+1)*i
-                    # print(vlineValue)
-                    plt.vlines(x=vlineValue, ymin=0, ymax=2, colors="gray",
-                               linestyles="dashed", label="epoch"+str(i))
-                plt.legend()
-
-                # ロスの線が潰れないように束でとって平均化する
-                batch = 100
-                pltLossList = []
-                pltX = []
-                for i in range(int(len(model.lossList)/batch)+1):
-                    if i*batch+batch < len(model.lossList):
-                        pltLossList.append(
-                            np.mean(model.lossList[i*batch:i*batch+batch]))
-                        print(i*batch, i*batch+batch)
-                    else:
-                        pltLossList.append(np.mean(model.lossList[i*batch:]))
-                        print(i*batch)
-                    pltX.append(i*batch)
-                plt.plot(pltX, pltLossList)
-
-                imgDirPath = dirPath + "image/"
-                imgPath = imgDirPath + "loss-" + args.label + ".png"
-                if not os.path.exists(imgDirPath):
-                    os.mkdir(imgDirPath)
-                fig.savefig(imgPath)
-
-                with open(dirPath + "args.json", "w") as f:
-                    json.dump(vars(args), f, indent=4)
-
-                line_notify("172.21.65.47: specterのtrain.py" +
-                            "の" + args.label + "の観点" + "が終了")
-
-                del model
-                del logger
-                del trainer
-                del filepath
-                del fig
-                torch.cuda.empty_cache()
-
-    except Exception as e:
-        print(traceback.format_exc())
-        message = "172.21.65.47: Error: " + \
-            os.path.basename(__file__) + " " + str(traceback.format_exc())
-        line_notify(message)
+        trainer.fit(model)
 
 
 if __name__ == '__main__':
