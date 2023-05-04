@@ -349,13 +349,6 @@ class Specter(pl.LightningModule):
         self.tokenizer.model_max_length = self.model.config.max_position_embeddings
         self.hparams.seqlen = self.model.config.max_position_embeddings
 
-        # BERTの出力トークンを統合するレイヤー
-        # input_size: 各時刻における入力ベクトルのサイズ、ここではBERTの出力の768次元になる
-        # hidden_size: メモリセルとかゲートの隠れ層の次元、出力のベクトルの次元もこの値になる（Batch_size, sequence_length, hidden_size)
-        #   chatGPTによると一般的には、LSTMの隠れ層の次元は、入力データの次元と同じであることが多い
-        self.lstm = nn.LSTM(input_size=bertOutputSize,
-                            hidden_size=bertOutputSize, batch_first=True)
-
         self.triple_loss = TripletLoss(margin=float(init_args.margin))
         # number of training instances
         self.training_size = None
@@ -372,9 +365,11 @@ class Specter(pl.LightningModule):
         # in lightning, forward defines the prediction/inference actions
         source_embedding = self.model(
             input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
-        out, _ = self.lstm(source_embedding['last_hidden_state'], None)
 
-        return out[:, -1, :]
+        # max_poolingを取って、765×単語数の行列を765×1に変換する　(参考 https://www.ai-shift.co.jp/techblog/2145)
+        sequence_output, _ = source_embedding['last_hidden_state'].max(1)
+
+        return sequence_output
 
     def _get_loader(self, split):
         if split == 'train':
@@ -656,9 +651,9 @@ def main():
                 labelList = [args.label]
             else:
                 labelList = ["title", "bg", "obj", "method", "res"]
-                
+
             line_notify("172.21.:" + os.path.basename(__file__) + "が開始")
-            
+
             model = Specter(args)
 
             # default logger used by trainer
